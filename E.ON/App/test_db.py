@@ -1,6 +1,6 @@
 import sys
 import os
-# Add the directory containing the 'App' package to the Python path
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from App import models, database

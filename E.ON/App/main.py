@@ -1,19 +1,29 @@
 import uvicorn
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-import requests # Pentru a trimite comanda către ESP32
-import os
-import random # Pentru a genera date simulate mai realiste
-
 from sqlalchemy.orm import Session
+import shutil
+import cv2
+import numpy as np
+import os
+from datetime import datetime
+
 from . import models, database
+
+# Import AI logic
+try:
+    from .meter_reader import GasMeterReader
+except ImportError:
+    from meter_reader import GasMeterReader
 
 app = FastAPI()
 
-# Creăm tabelele în baza de date (dacă e cazul)
+# Init AI models
+ai_reader = GasMeterReader()
+
+# PostgreSQL tables
 models.Base.metadata.create_all(bind=database.engine)
 
-# Permitem Flutter-ului (Web/Mobil) să comunice cu serverul
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,67 +31,89 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Adresa IP a ESP32-CAM (o găsești în Serial Monitor-ul din Arduino IDE)
-ESP32_IP = "http://192.168.1.XX" 
+# Folder for saved uploads
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-@app.post("/upload-meter-photo")
-async def trigger_and_process(db: Session = Depends(database.get_db)):
-    """
-    Pasul 1: Aplicația Flutter apelează acest endpoint.
-    Pasul 2: Serverul cere ESP32-ului să facă o poză.
-    """
-    try:
-        print("Solicit poză de la ESP32...")
-        # Trimitem un semnal către ESP32 (trebuie să ai un endpoint /capture pe ESP)
-        # timeout-ul este important pentru că procesarea pozei durează
-        response = requests.get(f"{ESP32_IP}/capture", timeout=10)
-        
-        if response.status_code == 200:
-            # Aici vei apela funcția ta de OCR (pe care o vom scrie ulterior)
-            # Momentan simulăm o citire (adaugam variatie random pentru teste):
-            base_reading = 125.40 
-            simulated_reading = base_reading + random.uniform(0.1, 5.0)
-            
-            # Salvăm în baza de date
-            new_reading = models.MeterReading(
-                reading_value=simulated_reading,
-                meter_id="meter_esp32_01"  # Nume hardcodat momentan
-            )
-            db.add(new_reading)
-            db.commit()
-            db.refresh(new_reading)
-            
-            print(f"Citire salvată în DB: {new_reading.reading_value} (ID: {new_reading.id})")
-            return {
-                "status": "success",
-                "reading": new_reading.reading_value,
-                "record_id": new_reading.id,
-                "message": "Poza a fost capturată, procesată și salvată în baza de date!"
-            }
-        else:
-            raise HTTPException(status_code=500, detail="ESP32 nu a putut face poza")
-            
-    except Exception as e:
-        print(f"Eroare: {e}")
-        # Dacă ESP32 nu e pornit, returnăm totuși ceva să nu crape aplicația
-        return {"status": "error", "message": str(e), "reading": 0.0}
-
-# Endpoint separat prin care ESP32 poate trimite poza direct (dacă e configurat așa)
+# Endpoint 1: for ESP32 (wakes up -> takes picture -> sends -> shuts down)
 @app.post("/receive-image")
-async def receive_image(file: UploadFile = File(...)):
-    file_location = f"uploads/{file.filename}"
-    with open(file_location, "wb+") as file_object:
-        file_object.write(file.file.read())
-    return {"info": f"Fișier salvat la {file_location}"}
+async def receive_image_from_esp32(file: UploadFile = File(...), db: Session = Depends(database.get_db)):
+    
+    # Automatically called by ESP32
+    print(f"[{datetime.now()}] ESP32 connection received...")
+    
+    try:
+        # Read image directly from the memory for OpenCV
+        contents = await file.read()
+        nparr = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-# --- ENDPOINT NOU PENTRU CITIREA DATELOR DIN DB ---
+        if img is None:
+            print("Error: Image couldn't be decoded.")
+            raise HTTPException(status_code=400, detail="Invalid image")
+
+        # *Save image on disk just for verification
+        filename = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        save_path = os.path.join(UPLOAD_DIR, filename)
+        cv2.imwrite(save_path, img)
+        print(f"Image saved at: {save_path}")
+
+        # Process AI
+        detected_value_str = ai_reader.process_image(img) # process_image returns a string
+        
+        final_reading = 0.0
+        status = "FAILED"
+
+        if detected_value_str:
+            try:
+                final_reading = float(detected_value_str)
+                status = "SUCCESS"
+                print(f"✅ AI Detected: {final_reading}")
+            except ValueError:
+                status = "INVALID_FORMAT"
+                print(f"⚠️ AI returned invalid format: {detected_value_str}")
+        else:
+            status = "NO_DIGITS"
+            print("❌ AI hasn't found any digits.")
+
+        # Save data in DB Postgres
+        new_reading = models.MeterReading(
+            reading_value=final_reading,
+            meter_id="esp32_cam_01",
+            status=status,
+            # recorded_at is automatically in the db
+        )
+        db.add(new_reading)
+        db.commit()
+        db.refresh(new_reading)
+
+        # Respond to ESP32 (like a feedback)
+        return {"status": "ok", "command": "SLEEP_NOW"}
+
+    except Exception as e:
+        print(f"Eroare server: {e}")
+        return {"status": "error", "detail": str(e)}
+
+# Endpoint 2 : for Flutter (user wants to see the data)
 @app.get("/readings")
 async def get_readings(limit: int = 10, db: Session = Depends(database.get_db)):
-    """
-    Returnează ultimele înregistrări din baza de date pentru a le afișa în Flutter.
-    """
-    readings = db.query(models.MeterReading).order_by(models.MeterReading.recorded_at.desc()).limit(limit).all()
-    return {"status": "success", "data": readings}
+   # it doesn't wake the ESP32 up
+    readings = db.query(models.MeterReading)\
+                 .order_by(models.MeterReading.recorded_at.desc())\
+                 .limit(limit)\
+                 .all()
+    
+    # Transform data in a simpler format for Flutter
+    data = []
+    for r in readings:
+        data.append({
+            "id": r.id,
+            "value": r.reading_value,
+            "date": r.recorded_at.strftime("%Y-%m-%d %H:%M"),
+            "status": r.status
+        })
+        
+    return {"status": "success", "data": data}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

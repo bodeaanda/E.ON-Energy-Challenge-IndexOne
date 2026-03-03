@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http; // Importăm librăria pentru request-uri
-import 'dart:convert'; // Importăm pentru a decoda răspunsul JSON de la server
+import 'services/api_service.dart';
 
 void main() {
   runApp(const MyApp());
@@ -13,11 +12,12 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Smart Gas Meter',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
         useMaterial3: true,
       ),
-      home: const MyHomePage(title: 'Control Contor Gaz'),
+      home: const MyHomePage(title: 'Istoric Consum Gaz'),
     );
   }
 }
@@ -31,53 +31,7 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  // Schimbăm în double pentru că citirea contorului poate avea zecimale
-  double _lastReading = 0.0; 
-  bool _isRequesting = false; // Status pentru a arăta că așteptăm răspunsul
-
-  // Funcția principală care "vorbește" cu backend-ul tău
-  Future<void> _requestGasReading() async {
-    setState(() {
-      _isRequesting = true;
-    });
-
-    // ATENȚIE: Dacă testezi în browser (Chrome) pe același PC, lasă localhost.
-    // Dacă testezi pe un telefon real, pune IP-ul calculatorului tău (ex: 192.168.1.15)
-    final url = Uri.parse('http://localhost:8000/upload-meter-photo');
-
-    try {
-      print("Trimit solicitare citire către server...");
-      final response = await http.post(url);
-
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        
-        setState(() {
-          // Luăm valoarea 'reading' din JSON-ul trimis de Python
-          _lastReading = (data['reading'] as num).toDouble();
-          _isRequesting = false;
-        });
-        
-        print("Citire reușită: $_lastReading");
-      } else {
-        print("Eroare server: ${response.statusCode}");
-        _showErrorSnackBar("Eroare la server: ${response.statusCode}");
-      }
-    } catch (e) {
-      print("Eroare conexiune: $e");
-      _showErrorSnackBar("Nu pot contacta serverul. Verifică dacă Python rulează!");
-    } finally {
-      setState(() {
-        _isRequesting = false;
-      });
-    }
-  }
-
-  void _showErrorSnackBar(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message), backgroundColor: Colors.red),
-    );
-  }
+  final ApiService _apiService = ApiService();
 
   @override
   Widget build(BuildContext context) {
@@ -85,34 +39,103 @@ class _MyHomePageState extends State<MyHomePage> {
       appBar: AppBar(
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         title: Text(widget.title),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: () {
+              setState(() {}); 
+            },
+          )
+        ],
       ),
       body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const Text(
-              'Ultima valoare citită de pe contor:',
-              style: TextStyle(fontSize: 16),
-            ),
-            const SizedBox(height: 10),
-            // Afișăm un cerc de încărcare dacă așteptăm răspunsul
-            _isRequesting 
-              ? const CircularProgressIndicator()
-              : Text(
-                  '$_lastReading m³',
-                  style: Theme.of(context).textTheme.headlineLarge?.copyWith(
-                    fontWeight: FontWeight.bold,
-                    color: Colors.deepPurple,
-                  ),
+        child: FutureBuilder<List<dynamic>>(
+          future: _apiService.fetchReadings(),
+          builder: (context, snapshot) {
+            
+            // 1. Încărcare
+            if (snapshot.connectionState == ConnectionState.waiting) {
+              return const Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 10),
+                  Text("Se încarcă datele..."),
+                ],
+              );
+            } 
+            
+            // 2. Eroare
+            else if (snapshot.hasError) {
+              return Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Text(
+                  "Eroare: ${snapshot.error}\n\nVerifică dacă serverul Python rulează și IP-ul e corect în api_service.dart",
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.red),
                 ),
-          ],
+              );
+            } 
+            
+            // 3. Avem date
+            else if (snapshot.hasData && snapshot.data!.isNotEmpty) {
+              var latest = snapshot.data![0];
+              
+              return Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const SizedBox(height: 20),
+                  const Text(
+                    'Ultima valoare citită:',
+                    style: TextStyle(fontSize: 18),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    '${latest['value']} m³', 
+                    style: Theme.of(context).textTheme.headlineLarge?.copyWith(
+                          fontWeight: FontWeight.bold,
+                          color: Colors.deepPurple,
+                        ),
+                  ),
+                  const SizedBox(height: 5),
+                  Text(
+                    'Data: ${latest['date']}',
+                    style: const TextStyle(color: Colors.grey, fontSize: 14),
+                  ),
+                  const SizedBox(height: 30),
+                  const Divider(),
+                  const Padding(
+                    padding: EdgeInsets.all(8.0),
+                    child: Text("Istoric recent:", style: TextStyle(fontWeight: FontWeight.bold)),
+                  ),
+                  
+                  // Lista cu istoric
+                  Expanded(
+                    child: ListView.builder(
+                      itemCount: snapshot.data!.length,
+                      itemBuilder: (context, index) {
+                        var item = snapshot.data![index];
+                        return Card(
+                          margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                          child: ListTile(
+                            leading: const Icon(Icons.speed, color: Colors.deepPurple),
+                            title: Text("${item['value']} m³", style: const TextStyle(fontWeight: FontWeight.bold)),
+                            subtitle: Text(item['date']),
+                          ),
+                        );
+                      },
+                    ),
+                  )
+                ],
+              );
+            } 
+            
+            // 4. Listă goală
+            else {
+              return const Text("Nu există citiri în baza de date.");
+            }
+          },
         ),
-      ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _isRequesting ? null : _requestGasReading,
-        tooltip: 'Solicită Citire',
-        label: const Text("Citește Contorul"),
-        icon: const Icon(Icons.camera_alt),
       ),
     );
   }
