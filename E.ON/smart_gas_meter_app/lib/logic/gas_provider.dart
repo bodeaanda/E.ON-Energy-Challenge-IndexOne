@@ -20,7 +20,7 @@ class GasProvider extends ChangeNotifier {
     try {
       _readings = await _apiService.fetchReadings();
     } catch (e) {
-      _errorMessage = "A apărut o problemă de conexiune: $e";
+      _errorMessage = "A connection problem has occured: $e";
       print(e);
     }
 

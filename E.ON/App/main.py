@@ -2,13 +2,12 @@ import uvicorn
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-import shutil
 import cv2
 import numpy as np
 import os
 from datetime import datetime
 
-from . import models, database
+from . import models, database, analytics 
 
 # Import AI logic
 try:
@@ -19,9 +18,15 @@ except ImportError:
 app = FastAPI()
 
 # Init AI models
-ai_reader = GasMeterReader()
+print("Initializing AI...")
+try:
+    ai_reader = GasMeterReader()
+    print("AI Loaded.")
+except:
+    ai_reader = None
+    print("AI Failed to load.")
 
-# PostgreSQL tables
+# PostgreSQL tables initialization
 models.Base.metadata.create_all(bind=database.engine)
 
 app.add_middleware(
@@ -35,75 +40,85 @@ app.add_middleware(
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Endpoint 1: for ESP32 (wakes up -> takes picture -> sends -> shuts down)
+# Endpoint 1: for ESP32
 @app.post("/receive-image")
 async def receive_image_from_esp32(file: UploadFile = File(...), db: Session = Depends(database.get_db)):
     
-    # Automatically called by ESP32
-    print(f"[{datetime.now()}] ESP32 connection received...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Connection received...")
     
     try:
-        # Read image directly from the memory for OpenCV
+        # 1. Read image
         contents = await file.read()
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if img is None:
-            print("Error: Image couldn't be decoded.")
             raise HTTPException(status_code=400, detail="Invalid image")
 
-        # *Save image on disk just for verification
+        # 2. Save backup
         filename = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         save_path = os.path.join(UPLOAD_DIR, filename)
         cv2.imwrite(save_path, img)
-        print(f"Image saved at: {save_path}")
 
-        # Process AI
-        detected_value_str = ai_reader.process_image(img) # process_image returns a string
-        
+        # 3. Process AI
         final_reading = 0.0
         status = "FAILED"
 
-        if detected_value_str:
-            try:
-                final_reading = float(detected_value_str)
-                status = "SUCCESS"
-                print(f"✅ AI Detected: {final_reading}")
-            except ValueError:
-                status = "INVALID_FORMAT"
-                print(f"⚠️ AI returned invalid format: {detected_value_str}")
+        if ai_reader:
+            detected_value_str = ai_reader.process_image(img)
+            
+            if detected_value_str:
+                try:
+                    final_reading = float(detected_value_str)
+                    status = "SUCCESS"
+                    print(f"✅ AI Detected: {final_reading}")
+                except ValueError:
+                    status = "INVALID_FORMAT"
+            else:
+                status = "NO_DIGITS"
+                print("❌ AI hasn't found digits.")
         else:
-            status = "NO_DIGITS"
-            print("❌ AI hasn't found any digits.")
+            status = "AI_ERROR"
 
-        # Save data in DB Postgres
+        # 4. Save to DB
         new_reading = models.MeterReading(
             reading_value=final_reading,
             meter_id="esp32_cam_01",
-            status=status,
-            # recorded_at is automatically in the db
+            status=status
         )
         db.add(new_reading)
         db.commit()
         db.refresh(new_reading)
 
-        # Respond to ESP32 (like a feedback)
-        return {"status": "ok", "command": "SLEEP_NOW"}
+        # 5. RUN ANALYTICS (Anomaly Detection)
+        # Luam toate citirile din DB
+        all_readings = db.query(models.MeterReading).all()
+
+        # APELAM FUNCTIA DIN MODULUL IMPORTAT 'analytics'
+        is_anomaly, message = analytics.detect_anomaly(all_readings)
+
+        # 6. Return Combined Response
+        # Trimitem si datele pentru Flutter (anomalie), si comanda pentru ESP32 (Sleep)
+        return {
+            "status": "success",
+            "value": final_reading,
+            "is_anomaly": is_anomaly,       # <--- Pentru Flutter
+            "alert_message": message,       # <--- Pentru Flutter
+            "command": "SLEEP_NOW"          # <--- Pentru ESP32
+        }
 
     except Exception as e:
-        print(f"Eroare server: {e}")
+        print(f"Server Error: {e}")
         return {"status": "error", "detail": str(e)}
 
-# Endpoint 2 : for Flutter (user wants to see the data)
+# Endpoint 2 : for Flutter history
 @app.get("/readings")
 async def get_readings(limit: int = 10, db: Session = Depends(database.get_db)):
-   # it doesn't wake the ESP32 up
     readings = db.query(models.MeterReading)\
                  .order_by(models.MeterReading.recorded_at.desc())\
                  .limit(limit)\
                  .all()
     
-    # Transform data in a simpler format for Flutter
     data = []
     for r in readings:
         data.append({

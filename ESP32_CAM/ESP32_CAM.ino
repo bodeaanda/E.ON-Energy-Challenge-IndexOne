@@ -1,12 +1,24 @@
 #include "esp_camera.h"
 #include <Wire.h>
 #include <Rtc_Pcf8563.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
 
-// --- CONFIGURARE PINI REZULTATĂ DIN MĂSURĂTORI ---
+// --- CONFIGURARE REȚEA ---
+const char* ssid = "marasti3";           
+const char* password = "calinlungu";     
+const char* serverName = "http://192.168.0.67:8000/receive-image"; 
+
+// --- CONFIGURARE PINI ---
 const int PIN_LATCH = 14; 
-const int I2C_SDA = 2;    // MUTAT PE GPIO 2 (curat)
-const int I2C_SCL = 15;   // PE GPIO 15 (curat)
+const int I2C_SDA = 2;    
+const int I2C_SCL = 15;   
 const int PIN_FLASH = 4;
+
+// --- CONFIGURARE FLASH (1/3 LUMINĂ) ---
+const int flashFreq = 5000; 
+const int flashRes = 8;     
+const int flashBrightness = 10; // 1/3 din 255 este ~85
 
 // Configurație Cameră AI-Thinker
 #define PWDN_GPIO_NUM     32
@@ -27,22 +39,41 @@ const int PIN_FLASH = 4;
 #define PCLK_GPIO_NUM     22
 
 void setup() {
-  // 1. LATCH - Pornim imediat pe pinul 14
+  // 1. LATCH - Pornim imediat
   pinMode(PIN_LATCH, OUTPUT);
   digitalWrite(PIN_LATCH, HIGH); 
 
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n[SISTEM] >> Latch pe 14, I2C pe 2 si 15");
+  Serial.println("\n[SISTEM] >> Start...");
+
+  // --- CONFIGURARE PWM FLASH (Versiunea Nouă ESP32) ---
+  ledcAttach(PIN_FLASH, flashFreq, flashRes);
+
+  // --- CONECTARE WIFI ---
+  Serial.print("[WIFI]    >> Conectare la ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  
+  int wifi_attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && wifi_attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    wifi_attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WIFI]    >> Conectat! IP: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\n[WIFI]    >> ESEC conexiune!");
+  }
 
   // 2. PORNIRE I2C
   Wire.begin(I2C_SDA, I2C_SCL);
   
   Wire.beginTransmission(0x51);
   if (Wire.endTransmission() == 0) {
-    Serial.println("[RTC]    >> GASIT pe pinii 2 si 15!");
-  } else {
-    Serial.println("[ERROR]  >> RTC nu raspunde pe 2 si 15. Verifica firele!");
+    Serial.println("[RTC]     >> OK.");
   }
 
   // 3. INITIALIZARE CAMERA
@@ -58,38 +89,74 @@ void setup() {
   config.pin_sscb_sda = SIOD_GPIO_NUM; config.pin_sscb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000; config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_VGA; config.jpeg_quality = 12; config.fb_count = 1;
+  config.frame_size = FRAMESIZE_VGA; 
+  config.jpeg_quality = 12; 
+  config.fb_count = 1;
 
   if (esp_camera_init(&config) == ESP_OK) {
     Serial.println("[CAMERA] >> OK.");
-    pinMode(PIN_FLASH, OUTPUT);
-    digitalWrite(PIN_FLASH, HIGH);
+    
+    // --- FLASH ON LA 1/3 (85) ---
+    ledcWrite(PIN_FLASH, flashBrightness); 
     delay(500);
+    
     camera_fb_t * fb = esp_camera_fb_get();
+    
+    // --- FLASH OFF ---
+    ledcWrite(PIN_FLASH, 0); 
+    
     if (fb) {
-      Serial.printf("[FOTO]   >> Captura OK (%zu bytes).\n", fb->len);
+      Serial.printf("[FOTO]    >> Captura OK (%zu bytes).\n", fb->len);
+
+      if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        http.begin(serverName);
+
+        String boundary = "----ESP32Boundary123456";
+        String head = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"capture.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+        String tail = "\r\n--" + boundary + "--\r\n";
+
+        size_t totalLen = head.length() + fb->len + tail.length();
+        uint8_t *post_data = (uint8_t *)ps_malloc(totalLen); 
+        
+        if (post_data) {
+          memcpy(post_data, head.c_str(), head.length());
+          memcpy(post_data + head.length(), fb->buf, fb->len);
+          memcpy(post_data + head.length() + fb->len, tail.c_str(), tail.length());
+
+          http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+          
+          Serial.println("[SERVER] >> Trimitere HTTP...");
+          int httpResponseCode = http.POST(post_data, totalLen);
+
+          if (httpResponseCode > 0) {
+            Serial.printf("[SERVER] >> Raspuns: %d\n", httpResponseCode);
+          } else {
+            Serial.printf("[SERVER] >> EROARE: %d\n", httpResponseCode);
+          }
+          free(post_data);
+        } else {
+          Serial.println("[SERVER] >> EROARE: Memorie PSRAM insuficienta!");
+        }
+        http.end();
+      }
       esp_camera_fb_return(fb);
     }
-    digitalWrite(PIN_FLASH, LOW);
   }
 
-  // 4. PROGRAMARE RTC (30 SECUNDE)
-  Wire.beginTransmission(0x51);
-  Wire.write(0x01); Wire.write(0x00); 
-  Wire.endTransmission();
-  Wire.beginTransmission(0x51);
-  Wire.write(0x0E); Wire.write(0x82); 
-  Wire.endTransmission();
-  Wire.beginTransmission(0x51);
-  Wire.write(0x0F); Wire.write(30);   
-  Wire.endTransmission();
-  Wire.beginTransmission(0x51);
-  Wire.write(0x01); Wire.write(0x11); 
-  Wire.endTransmission();
-
-  Serial.println("[RTC]    >> Programat. Inchidere LATCH...");
-  delay(500);
-  digitalWrite(PIN_LATCH, LOW); 
+  // 4. PROGRAMARE RTC & SHUTDOWN
+  programRTC();
 }
 
 void loop() {}
+
+void programRTC() {
+  Wire.beginTransmission(0x51); Wire.write(0x01); Wire.write(0x00); Wire.endTransmission();
+  Wire.beginTransmission(0x51); Wire.write(0x0E); Wire.write(0x82); Wire.endTransmission();
+  Wire.beginTransmission(0x51); Wire.write(0x0F); Wire.write(30);   Wire.endTransmission();
+  Wire.beginTransmission(0x51); Wire.write(0x01); Wire.write(0x11); Wire.endTransmission();
+  
+  Serial.println("[RTC]     >> Sleep. Bye!");
+  delay(200);
+  digitalWrite(PIN_LATCH, LOW); 
+}
